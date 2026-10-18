@@ -48,7 +48,7 @@ const { formatLedgerSequence } = require("../utils/formatLedgerSequence");
 
 
 const axios = require("axios");
-const { Asset } = require("@stellar/stellar-sdk");
+const { Asset, xdr, scValToNative } = require("@stellar/stellar-sdk");
 const { normalizeAsset, normalizeAssetFromString } = require("../utils/asset");
 const { isNativeAsset, isNonNativeAsset } = require("../utils/assetHelpers");
 const { getAssetMetadataFromToml, fetchStellarToml } = require("../utils/tomlResolver");
@@ -5476,6 +5476,206 @@ router.get("/:id/funding-history", async (req, res, next) => {
       fundingSources,
       firstFundedAt,
       totalFundingAmount,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * Decodes a base64 ScVal parameter from a Horizon invoke_host_function
+ * operation into its native JS value. Returns null when it cannot be decoded.
+ */
+function decodeHostFunctionParam(param) {
+  if (!param || typeof param.value !== "string") return null;
+  try {
+    return scValToNative(xdr.ScVal.fromXDR(param.value, "base64"));
+  } catch (_) {
+    return null;
+  }
+}
+
+function mapContractInteraction(op) {
+  const params = Array.isArray(op.parameters) ? op.parameters : [];
+  const isInvokeContract = String(op.function || "").includes("InvokeContract");
+
+  let contractId = op.address || null;
+  let functionName = null;
+
+  if (isInvokeContract) {
+    const decodedContract = decodeHostFunctionParam(params[0]);
+    const decodedFunction = decodeHostFunctionParam(params[1]);
+    if (decodedContract !== null) contractId = String(decodedContract);
+    if (decodedFunction !== null) functionName = String(decodedFunction);
+  }
+
+  return {
+    contractId,
+    functionName,
+    transactionHash: op.transaction_hash || null,
+    timestamp: toISOTimestamp(op.created_at),
+    successful: op.transaction_successful !== false,
+  };
+}
+
+// Horizon has no server-side operation type filter for accounts, so we scan
+// pages of operations and keep only invoke_host_function records. The page
+// cap bounds the number of Horizon round-trips per request.
+const SMART_CONTRACT_SCAN_PAGE_SIZE = 200;
+const SMART_CONTRACT_SCAN_MAX_PAGES = 5;
+
+/**
+ * GET /account/:id/smart-contract-interactions
+ *
+ * Returns the account's Soroban contract interactions (invoke_host_function
+ * operations), newest first by default.
+ *
+ * Query params:
+ *   - limit  (number, default 20, max 200)
+ *   - order  ("asc" | "desc", default "desc")
+ *   - cursor (string) — paging token returned as `cursor` by a previous call
+ *
+ * Each interaction: { contractId, functionName, transactionHash, timestamp, successful }
+ */
+router.get("/:id/smart-contract-interactions", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const { limit, order, cursor } = parsePaginationParams(req.query, 200);
+
+    const interactions = [];
+    let lastToken = cursor;
+    let lastInteractionToken = null;
+
+    for (let page = 0; page < SMART_CONTRACT_SCAN_MAX_PAGES; page++) {
+      let query = server
+        .operations()
+        .forAccount(id)
+        .limit(SMART_CONTRACT_SCAN_PAGE_SIZE)
+        .order(order);
+      if (lastToken) query = query.cursor(lastToken);
+
+      const response = await withHorizonTiming(req, () => query.call());
+      const records = response.records || [];
+
+      for (const op of records) {
+        if (op.type !== "invoke_host_function") continue;
+        interactions.push(mapContractInteraction(op));
+        lastInteractionToken = op.paging_token;
+        if (interactions.length === limit) break;
+      }
+
+      if (
+        interactions.length === limit ||
+        records.length < SMART_CONTRACT_SCAN_PAGE_SIZE
+      ) {
+        break;
+      }
+      lastToken = records[records.length - 1].paging_token;
+    }
+
+    const nextCursor =
+      interactions.length === limit ? lastInteractionToken : null;
+
+    return success(res, {
+      accountId: id,
+      interactions,
+      total: interactions.length,
+      limit,
+      cursor: nextCursor,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+const STROOPS_PER_UNIT = 10000000n;
+
+/**
+ * Converts a Horizon decimal amount string (up to 7 decimals) into BigInt
+ * stroops so large trustline limits keep full precision.
+ */
+function amountToStroops(value) {
+  const match = String(value ?? "0").trim().match(/^(-?)(\d+)(?:\.(\d{0,7}))?/);
+  if (!match) return 0n;
+  const [, sign, whole, fraction = ""] = match;
+  const stroops = BigInt(whole) * STROOPS_PER_UNIT + BigInt(fraction.padEnd(7, "0"));
+  return sign === "-" ? -stroops : stroops;
+}
+
+function stroopsToAmount(stroops) {
+  const negative = stroops < 0n;
+  const abs = negative ? -stroops : stroops;
+  const whole = abs / STROOPS_PER_UNIT;
+  const fraction = (abs % STROOPS_PER_UNIT).toString().padStart(7, "0");
+  return `${negative ? "-" : ""}${whole}.${fraction}`;
+}
+
+/**
+ * GET /account/:id/receive-capacity
+ *
+ * Returns how much more of each held asset the account can receive.
+ *
+ *   - Trustlines: remaining = limit - balance (never negative) and
+ *     remainingPercent = ((limit - balance) / limit) * 100, rounded to 2 dp.
+ *   - Native XLM: has no limit; remaining is the spendable balance
+ *     (balance minus the (2 + subentryCount) * 0.5 XLM minimum reserve).
+ */
+router.get("/:id/receive-capacity", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+    const balances = account.balances || [];
+
+    const BASE_RESERVE_STROOPS = 5000000n; // 0.5 XLM
+    const minimumReserve =
+      BigInt(2 + (account.subentry_count || 0)) * BASE_RESERVE_STROOPS;
+
+    const capacities = [];
+
+    const nativeBalance = balances.find((b) => isNativeAsset(b));
+    if (nativeBalance) {
+      const balance = amountToStroops(nativeBalance.balance);
+      const spendable = balance - minimumReserve;
+      capacities.push({
+        asset: normalizeAsset(null, null, "native"),
+        balance: stroopsToAmount(balance),
+        limit: null,
+        remaining: stroopsToAmount(spendable > 0n ? spendable : 0n),
+        remainingPercent: null,
+      });
+    }
+
+    // Liquidity pool shares have no asset code and cannot be received directly.
+    const trustlines = balances.filter(
+      (entry) => isNonNativeAsset(entry) && entry.asset_code,
+    );
+
+    for (const b of trustlines) {
+      const balance = amountToStroops(b.balance);
+      const limit = amountToStroops(b.limit);
+      const diff = limit - balance;
+      const remaining = diff > 0n ? diff : 0n;
+      const remainingPercent =
+        limit > 0n
+          ? Number(((Number(remaining) / Number(limit)) * 100).toFixed(2))
+          : 0;
+
+      capacities.push({
+        asset: normalizeAsset(b.asset_code, b.asset_issuer, b.asset_type),
+        balance: stroopsToAmount(balance),
+        limit: stroopsToAmount(limit),
+        remaining: stroopsToAmount(remaining),
+        remainingPercent,
+      });
+    }
+
+    return success(res, {
+      accountId: id,
+      capacities,
     });
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
