@@ -51,11 +51,13 @@ This project is ideal for:
 - [API Design Guidelines](docs/api-design.md) - Design conventions and response patterns
 - [Response Format Guide](docs/response-format.md) - Standard response envelopes, pagination, and data formats
 - [Streaming Guide](docs/streaming.md) - SSE and WebSocket streaming endpoints, event payloads, reconnection, and clean close handling
+- [Real-Time Guide](docs/real-time-guide.md) - Build real-time Stellar apps by combining SSE/WebSocket streams with REST calls and polling, handling interruptions, and a complete Node.js balance monitor
 - [Webhooks Guide](docs/webhooks.md) - Register webhooks, available events, payload shapes, signature verification, retries, and unregistration
 - [Webhook Security Guide](docs/webhook-security.md) - Verify HMAC-SHA256 delivery signatures in Node.js/Python/Go, handle invalid signatures, store secrets safely, and rotate with the dual-secret pattern
 - [Batch Endpoints Guide](docs/batch-endpoints.md) - Batch trust-status, freeze-status, and transaction status APIs, limits, and when to use batch vs individual
 - [DEX Endpoints Guide](docs/dex-endpoints.md) - All six DEX endpoints with curl examples, sample responses, and guidance on spread vs depth vs imbalance vs arbitrage
 - [Compliance Endpoints Guide](docs/compliance-endpoints.md) - All compliance and risk endpoints with curl examples, sample responses, and a complete compliance workflow
+- [Compliance Workflow Guide](docs/compliance-workflow.md) - Step-by-step KYC/AML workflow chaining risk score, watchlist, transaction velocity, compliance check, and freeze check into a compliance report
 - [Network Endpoints Guide](docs/network-endpoints.md) - All network and fee endpoints with curl examples, cache TTLs, and sample responses
 - [Caching Strategy](docs/caching-strategy.md) - Per-endpoint cache TTLs and configuration
 - [Logging Guide](docs/logging.md) - Log levels, configuration, structured log entry fields, JSON parsing, and production monitoring
@@ -67,6 +69,7 @@ This project is ideal for:
 - [Account Endpoints Guide](docs/account-endpoints.md) - Account endpoints grouped by use case (portfolio, activity, multisig, compliance) with curl examples for every endpoint
 - [Transaction Endpoints Guide](docs/transaction-endpoints.md) - Transaction and operation endpoints for building explorers and submission tools, with curl examples and usage patterns
 - [Rate Limiting](docs/rate-limiting.md) - Default limits, configuration, response headers, and retry strategies
+- [Rate Limiting Strategies Guide](docs/rate-limiting-strategies.md) - Practical guide for high-volume apps: request batching, caching, `?fresh=true` timing, endpoint polling priority, and a complete exponential backoff implementation
 - [Frequently Asked Questions (FAQ)](FAQ.md) - Common setup and contribution questions
 - [Utilities Guide](docs/utilities.md) - All utility endpoints with use cases, curl examples, and sample responses
 - [Asset Endpoints Guide](docs/asset-endpoints.md) - All six asset endpoints with curl examples, sample responses, and guidance on when to use each one
@@ -111,6 +114,7 @@ This project is ideal for:
 | GET | `/account/:id/funding-history` | Account funding sources with sender, amount, asset, and timestamp | — |
 | GET | `/account/:id/trades` | DEX trades for the account | `limit`, `order`, `cursor`, `fresh` |
 | GET | `/account/:id/offers` | Open DEX offers for an account | `limit`, `cursor` |
+| GET | `/account/:id/offers-summary` | Open offer totals per asset (sell locked, buy committed) and oldest offer age; cached | `fresh` |
 | GET | `/account/:id/offer-history` | Historical offer operations | `limit`, `order`, `cursor` |
 | GET | `/account/:id/analytics` | Account activity analytics: transaction frequency, first/last seen timestamps, and average transactions per day | — |
 | GET | `/account/:id/transaction-count` | Total transaction count, first and last transaction timestamps | — |
@@ -118,6 +122,8 @@ This project is ideal for:
 | GET | `/account/:id/funding-history` | Initial funding sources sorted by amount descending | — |
 | GET | `/account/:id/volume` | Transaction volume by asset over a time period (default: 30 days, max: 90 days) | `days` (default: 30, max: 90) |
 | GET | `/account/:id/risk-score` | Computed risk score and contributing factors | — |
+| GET | `/account/:id/fee-spending` | Network fees paid, broken down by operation type | `days` (default: 30, max: 90) |
+| GET | `/account/:id/smart-contract-interactions` | Soroban contract calls (contractId, function, timestamp, success) | `limit`, `cursor` |
 | GET | `/account/:id/freeze-status/:assetCode/:assetIssuer` | Check if an asset is frozen on an account | — |
 | GET | `/account/:id/can-receive/:assetCode/:assetIssuer` | Check if an account can receive a specific asset | — |
 | GET | `/account/:id/signers` | Account signers, their weights, and threshold configuration | — |
@@ -126,7 +132,11 @@ This project is ideal for:
 | GET | `/account/:id/sponsorships` | **Preferred.** Typed sponsorship summary with `sponsoredBy` and `sponsoring` arrays; each entry includes `type`, `address`, `sponsor`, and `reserveAmount`. More structured than `/sponsorship`. Note: will be consolidated with `/sponsorship` in a future release (see issue #19). | — |
 | GET | `/account/:id/claimable-balances/eligible` | Evaluates every claimable balance where the account is a claimant and categorises each as eligible, not yet claimable, or expired. See the [Claimable Balances](#understanding-claimable-balances) section for details. | `limit`, `cursor`, `order`, `fresh` |
 | GET | `/account/:id/pool-positions` | Liquidity pool positions and share values | — |
+| GET | `/account/:id/liquidity-contribution` | Liquidity pool contributions per pool and totals per asset (cached) | `fresh` |
+| GET | `/account/:id/pending-effects` | Submitted operations that have not yet produced confirmed effects (never cached) | — |
+| GET | `/account/:id/historical-balances` | Balance snapshots over time reconstructed from payment and trade history | `asset` (`CODE:ISSUER`, default XLM), `resolution` (`7d`\|`30d`, default `7d`) |
 | GET | `/account/:id/counterparties` | Frequent payment counterparties | — |
+| GET | `/account/:id/payment-counterparty-risk` | Top payment counterparties by txCount with a risk level (`low`/`medium`/`high`) and risk factors for each | `limit` (default 10, max 20) |
 | GET | `/account/:id/transactions/search` | Search transactions by memo content | `memo`, `memo_type`, `limit`, `cursor`, `order` |
 | POST | `/account/:id/multisig-plan` | Signer combinations for each threshold | Body: `availableSigners` |
 
@@ -155,11 +165,13 @@ This project is ideal for:
 | Method | Path | Description | Query Params |
 | ------ | ---- | ----------- | ------------ |
 | GET | `/dex/price/:sellAsset/:buyAsset` | Effective exchange rate via best DEX path | `amount` |
+| GET | `/dex/best-path/:sourceAsset/:destAsset` | Optimal conversion path with estimated rate, slippage, and hops | `amount` |
 | GET | `/dex/spread/:sellAsset/:buyAsset` | Bid-ask spread for a trading pair | — |
 | GET | `/dex/depth/:sellAsset/:buyAsset` | Full order book depth analysis | — |
 | GET | `/dex/imbalance/:sellAsset/:buyAsset` | Buy/sell pressure imbalance detection | — |
 | GET | `/dex/arbitrage/:assetCode/:assetIssuer` | Circular arbitrage path discovery | — |
 | GET | `/dex/top-markets` | Top markets ranked by recent trade activity | `limit` |
+| GET | `/dex/volume-leaders` | Top assets ranked by 24h trading volume against XLM (5 min cache) | `limit` (default 10, max 50) |
 | GET | `/dex/pool-share-value/:poolId/:shares` | Calculate the equivalent value of pool shares in both reserve assets | — |
 
 ### Liquidity Pools
@@ -204,6 +216,7 @@ This project is ideal for:
 | GET | `/utils/ledger-date` | Estimate close date for a ledger sequence | `sequence` |
 | GET | `/utils/keypair` | Generate a random testnet keypair | — |
 | POST | `/utils/decode-xdr` | Decode a transaction XDR envelope to JSON | Body: `xdr` |
+| POST | `/utils/decode-transaction` | Human-readable transaction breakdown (fee, source, sequence, time bounds, memo, operations) | Body: `xdr` |
 
 ### Cache
 
@@ -2516,3 +2529,419 @@ Client recommendations
 - Implement retries with exponential backoff and jitter instead of tight loops.
 
 Note: This README section documents runtime behavior only — there are intentionally no code changes in this PR.
+
+const request = require("supertest");
+const app = require("../../app");
+
+jest.mock("../../services/assetHolders", () => ({
+  getAssetHolders: jest.fn(),
+}));
+
+jest.mock("../../services/dexPrice", () => ({
+  getCurrentPriceXLM: jest.fn(),
+}));
+
+const {
+  getAssetHolders,
+} = require("../../services/assetHolders");
+
+const {
+  getCurrentPriceXLM,
+} = require("../../services/dexPrice");
+
+describe("GET /asset/:code/:issuer/market-cap", () => {
+  const code = "TEST";
+  const issuer = "GISSUER123";
+
+  const url = () => `/asset/${code}/${issuer}/market-cap`;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  describe("circulating supply", () => {
+    test("excludes the issuer's 10% holding", async () => {
+      getAssetHolders.mockResolvedValue([
+        { account: issuer, balance: "10.0000000" },
+        { account: "GHOLDER1", balance: "40.0000000" },
+        { account: "GHOLDER2", balance: "50.0000000" },
+      ]);
+
+      getCurrentPriceXLM.mockResolvedValue(2);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.circulatingSupply).toBe("90.0000000");
+    });
+
+    test("returns zero when only the issuer holds the asset", async () => {
+      getAssetHolders.mockResolvedValue([
+        { account: issuer, balance: "1000.0000000" },
+      ]);
+
+      getCurrentPriceXLM.mockResolvedValue(3);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.circulatingSupply).toBe("0.0000000");
+      expect(response.body.marketCapXLM).toBe(0);
+    });
+
+    test("returns zero when the holder list is empty", async () => {
+      getAssetHolders.mockResolvedValue([]);
+      getCurrentPriceXLM.mockResolvedValue(1);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.circulatingSupply).toBe("0.0000000");
+    });
+
+    test("does not subtract an issuer balance when it is absent", async () => {
+      getAssetHolders.mockResolvedValue([
+        { account: "GHOLDER1", balance: "25.0000000" },
+        { account: "GHOLDER2", balance: "75.0000000" },
+      ]);
+
+      getCurrentPriceXLM.mockResolvedValue(1);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.circulatingSupply).toBe("100.0000000");
+    });
+
+    test("does not include the issuer in circulating supply", async () => {
+      getAssetHolders.mockResolvedValue([
+        { account: issuer, balance: "500.0000000" },
+        { account: "GHOLDER1", balance: "200.0000000" },
+      ]);
+
+      getCurrentPriceXLM.mockResolvedValue(0.1);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.circulatingSupply).toBe("200.0000000");
+    });
+  });
+
+  describe("market capitalization", () => {
+    test("computes market cap as circulating supply times price", async () => {
+      getAssetHolders.mockResolvedValue([
+        { account: issuer, balance: "100.0000000" },
+        { account: "GHOLDER1", balance: "600.0000000" },
+        { account: "GHOLDER2", balance: "300.0000000" },
+      ]);
+
+      getCurrentPriceXLM.mockResolvedValue(0.5);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.circulatingSupply).toBe("900.0000000");
+      expect(response.body.currentPriceXLM).toBe(0.5);
+      expect(response.body.marketCapXLM).toBe(450);
+    });
+
+    test("returns zero market cap for zero circulating supply", async () => {
+      getAssetHolders.mockResolvedValue([
+        { account: issuer, balance: "100.0000000" },
+      ]);
+
+      getCurrentPriceXLM.mockResolvedValue(10);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.marketCapXLM).toBe(0);
+    });
+
+    test("returns null market cap when price is unavailable", async () => {
+      getAssetHolders.mockResolvedValue([
+        { account: issuer, balance: "10.0000000" },
+        { account: "GHOLDER1", balance: "90.0000000" },
+      ]);
+
+      getCurrentPriceXLM.mockResolvedValue(null);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.currentPriceXLM).toBeNull();
+      expect(response.body.marketCapXLM).toBeNull();
+      expect(response.body.circulatingSupply).toBe("90.0000000");
+    });
+
+    test("supports a zero market price", async () => {
+      getAssetHolders.mockResolvedValue([
+        { account: issuer, balance: "10.0000000" },
+        { account: "GHOLDER1", balance: "90.0000000" },
+      ]);
+
+      getCurrentPriceXLM.mockResolvedValue(0);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.currentPriceXLM).toBe(0);
+      expect(response.body.marketCapXLM).toBe(0);
+    });
+
+    test("preserves a positive circulating supply at a small price", async () => {
+      getAssetHolders.mockResolvedValue([
+        { account: issuer, balance: "1.0000000" },
+        { account: "GHOLDER1", balance: "999.0000000" },
+      ]);
+
+      getCurrentPriceXLM.mockResolvedValue(0.000001);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.circulatingSupply).toBe("999.0000000");
+      expect(response.body.currentPriceXLM).toBe(0.000001);
+      expect(response.body.marketCapXLM).toBeCloseTo(0.000999);
+    });
+  });
+
+  describe("mock verification", () => {
+    test("requests holder data for the requested asset", async () => {
+      getAssetHolders.mockResolvedValue([]);
+      getCurrentPriceXLM.mockResolvedValue(null);
+
+      await request(app).get(url());
+
+      expect(getAssetHolders).toHaveBeenCalledWith(code, issuer);
+    });
+
+    test("requests DEX price data for the requested asset", async () => {
+      getAssetHolders.mockResolvedValue([]);
+      getCurrentPriceXLM.mockResolvedValue(null);
+
+      await request(app).get(url());
+
+      expect(getCurrentPriceXLM).toHaveBeenCalledWith(code, issuer);
+    });
+
+    test("queries both data sources once", async () => {
+      getAssetHolders.mockResolvedValue([]);
+      getCurrentPriceXLM.mockResolvedValue(null);
+
+      await request(app).get(url());
+
+      expect(getAssetHolders).toHaveBeenCalledTimes(1);
+      expect(getCurrentPriceXLM).toHaveBeenCalledTimes(1);
+    });
+  });
+});
+
+const request = require("supertest");
+const app = require("../../app");
+
+jest.mock("../../services/assetHolders", () => ({
+  getAssetHolders: jest.fn(),
+}));
+
+jest.mock("../../services/dexPrice", () => ({
+  getCurrentPriceXLM: jest.fn(),
+}));
+
+const {
+  getAssetHolders,
+} = require("../../services/assetHolders");
+
+const {
+  getCurrentPriceXLM,
+} = require("../../services/dexPrice");
+
+describe("GET /asset/:code/:issuer/market-cap", () => {
+  const code = "TEST";
+  const issuer = "GISSUER123";
+
+  const url = () => `/asset/${code}/${issuer}/market-cap`;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  describe("circulating supply", () => {
+    test("excludes the issuer's 10% holding", async () => {
+      getAssetHolders.mockResolvedValue([
+        { account: issuer, balance: "10.0000000" },
+        { account: "GHOLDER1", balance: "40.0000000" },
+        { account: "GHOLDER2", balance: "50.0000000" },
+      ]);
+
+      getCurrentPriceXLM.mockResolvedValue(2);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.circulatingSupply).toBe("90.0000000");
+    });
+
+    test("returns zero when only the issuer holds the asset", async () => {
+      getAssetHolders.mockResolvedValue([
+        { account: issuer, balance: "1000.0000000" },
+      ]);
+
+      getCurrentPriceXLM.mockResolvedValue(3);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.circulatingSupply).toBe("0.0000000");
+      expect(response.body.marketCapXLM).toBe(0);
+    });
+
+    test("returns zero when the holder list is empty", async () => {
+      getAssetHolders.mockResolvedValue([]);
+      getCurrentPriceXLM.mockResolvedValue(1);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.circulatingSupply).toBe("0.0000000");
+    });
+
+    test("does not subtract an issuer balance when it is absent", async () => {
+      getAssetHolders.mockResolvedValue([
+        { account: "GHOLDER1", balance: "25.0000000" },
+        { account: "GHOLDER2", balance: "75.0000000" },
+      ]);
+
+      getCurrentPriceXLM.mockResolvedValue(1);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.circulatingSupply).toBe("100.0000000");
+    });
+
+    test("does not include the issuer in circulating supply", async () => {
+      getAssetHolders.mockResolvedValue([
+        { account: issuer, balance: "500.0000000" },
+        { account: "GHOLDER1", balance: "200.0000000" },
+      ]);
+
+      getCurrentPriceXLM.mockResolvedValue(0.1);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.circulatingSupply).toBe("200.0000000");
+    });
+  });
+
+  describe("market capitalization", () => {
+    test("computes market cap as circulating supply times price", async () => {
+      getAssetHolders.mockResolvedValue([
+        { account: issuer, balance: "100.0000000" },
+        { account: "GHOLDER1", balance: "600.0000000" },
+        { account: "GHOLDER2", balance: "300.0000000" },
+      ]);
+
+      getCurrentPriceXLM.mockResolvedValue(0.5);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.circulatingSupply).toBe("900.0000000");
+      expect(response.body.currentPriceXLM).toBe(0.5);
+      expect(response.body.marketCapXLM).toBe(450);
+    });
+
+    test("returns zero market cap for zero circulating supply", async () => {
+      getAssetHolders.mockResolvedValue([
+        { account: issuer, balance: "100.0000000" },
+      ]);
+
+      getCurrentPriceXLM.mockResolvedValue(10);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.marketCapXLM).toBe(0);
+    });
+
+    test("returns null market cap when price is unavailable", async () => {
+      getAssetHolders.mockResolvedValue([
+        { account: issuer, balance: "10.0000000" },
+        { account: "GHOLDER1", balance: "90.0000000" },
+      ]);
+
+      getCurrentPriceXLM.mockResolvedValue(null);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.currentPriceXLM).toBeNull();
+      expect(response.body.marketCapXLM).toBeNull();
+      expect(response.body.circulatingSupply).toBe("90.0000000");
+    });
+
+    test("supports a zero market price", async () => {
+      getAssetHolders.mockResolvedValue([
+        { account: issuer, balance: "10.0000000" },
+        { account: "GHOLDER1", balance: "90.0000000" },
+      ]);
+
+      getCurrentPriceXLM.mockResolvedValue(0);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.currentPriceXLM).toBe(0);
+      expect(response.body.marketCapXLM).toBe(0);
+    });
+
+    test("preserves a positive circulating supply at a small price", async () => {
+      getAssetHolders.mockResolvedValue([
+        { account: issuer, balance: "1.0000000" },
+        { account: "GHOLDER1", balance: "999.0000000" },
+      ]);
+
+      getCurrentPriceXLM.mockResolvedValue(0.000001);
+
+      const response = await request(app).get(url());
+
+      expect(response.status).toBe(200);
+      expect(response.body.circulatingSupply).toBe("999.0000000");
+      expect(response.body.currentPriceXLM).toBe(0.000001);
+      expect(response.body.marketCapXLM).toBeCloseTo(0.000999);
+    });
+  });
+
+  describe("mock verification", () => {
+    test("requests holder data for the requested asset", async () => {
+      getAssetHolders.mockResolvedValue([]);
+      getCurrentPriceXLM.mockResolvedValue(null);
+
+      await request(app).get(url());
+
+      expect(getAssetHolders).toHaveBeenCalledWith(code, issuer);
+    });
+
+    test("requests DEX price data for the requested asset", async () => {
+      getAssetHolders.mockResolvedValue([]);
+      getCurrentPriceXLM.mockResolvedValue(null);
+
+      await request(app).get(url());
+
+      expect(getCurrentPriceXLM).toHaveBeenCalledWith(code, issuer);
+    });
+
+    test("queries both data sources once", async () => {
+      getAssetHolders.mockResolvedValue([]);
+      getCurrentPriceXLM.mockResolvedValue(null);
+
+      await request(app).get(url());
+
+      expect(getAssetHolders).toHaveBeenCalledTimes(1);
+      expect(getCurrentPriceXLM).toHaveBeenCalledTimes(1);
+    });
+  });
+});
